@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sqlite3
 import json
 import asyncio
@@ -8,22 +8,22 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
-import google.generativeai as genai
 from huggingface_hub import hf_hub_download
+from groq import Groq as GroqClient
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-APP_PASSWORD   = os.environ.get("APP_PASSWORD", "engineer123")
-HF_TOKEN       = os.environ.get("HF_TOKEN", "")
-DATASET_REPO   = "sachingomber/engineering-books-index"
-PORT           = int(os.environ.get("PORT", 7860))
-DB_PATH        = "/tmp/sqlite/books.db"
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+APP_PASSWORD  = os.environ.get("APP_PASSWORD", "engineer123")
+HF_TOKEN      = os.environ.get("HF_TOKEN", "")
+DATASET_REPO  = "sachingomber/engineering-books-index"
+PORT          = int(os.environ.get("PORT", 7860))
+DB_PATH       = "/tmp/sqlite/books.db"
 
-db_conn      = None
-gemini_model = None
-index_ready  = False
+db_conn     = None
+groq_client = None
+index_ready = False
 
 SYSTEM_PROMPT = """You are a warm and precise engineering reference assistant with access to 283 engineering textbooks covering thermodynamics, boilers, steam generation, heat exchangers, refrigeration, food processing, water treatment, and fluid mechanics.
 
@@ -50,7 +50,6 @@ def download_index():
         log.info("Download complete. Opening database...")
         db_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         db_conn.row_factory = sqlite3.Row
-        # Test query
         count = db_conn.execute("SELECT COUNT(*) FROM books").fetchone()[0]
         log.info(f"Index ready! {count:,} chunks in SQLite FTS5.")
         index_ready = True
@@ -61,11 +60,12 @@ def download_index():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global gemini_model
-    if GEMINI_API_KEY:
-        genai.configure(api_key=GEMINI_API_KEY)
-        gemini_model = genai.GenerativeModel("gemini-3.6-flash")
-        log.info("Gemini configured.")
+    global groq_client
+    if GROQ_API_KEY:
+        groq_client = GroqClient(api_key=GROQ_API_KEY)
+        log.info("Groq client configured.")
+    else:
+        log.warning("GROQ_API_KEY not set!")
     loop = asyncio.get_event_loop()
     loop.run_in_executor(None, download_index)
     yield
@@ -77,17 +77,21 @@ app = FastAPI(title="Engineering Voice Assistant", lifespan=lifespan)
 
 
 def search_books(query: str, n: int = 5):
-    # Escape FTS5 special chars
     safe_query = query.replace('"', '""')
-    rows = db_conn.execute(
-        """SELECT text, book_name, category, paragraph_num,
-                  rank as relevance
-           FROM books
-           WHERE books MATCH ?
-           ORDER BY rank
-           LIMIT ?""",
-        (safe_query, n)
-    ).fetchall()
+    try:
+        rows = db_conn.execute(
+            """SELECT text, book_name, category, paragraph_num, rank as relevance
+               FROM books WHERE books MATCH ? ORDER BY rank LIMIT ?""",
+            (safe_query, n)
+        ).fetchall()
+    except Exception:
+        # Fallback: simple word search
+        words = " ".join(f'"{w}"' for w in query.split()[:4] if len(w) > 2)
+        rows = db_conn.execute(
+            """SELECT text, book_name, category, paragraph_num, rank as relevance
+               FROM books WHERE books MATCH ? ORDER BY rank LIMIT ?""",
+            (words or "water", n)
+        ).fetchall()
     return [
         {"text": r["text"], "book_name": r["book_name"],
          "category": r["category"], "paragraph_num": r["paragraph_num"],
@@ -96,12 +100,21 @@ def search_books(query: str, n: int = 5):
     ]
 
 
-def build_prompt(query: str, passages: list) -> str:
+def generate_answer(query: str, passages: list) -> str:
     context = "\n\n---\n\n".join([
         f"[{p['category']} / {p['book_name']} - Para {p['paragraph_num']}]\n{p['text'][:1200]}"
         for p in passages
     ])
-    return f"{SYSTEM_PROMPT}\n\nSOURCE PASSAGES:\n{context}\n\nUSER QUESTION: {query}\n\nANSWER:"
+    response = groq_client.chat.completions.create(
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"SOURCE PASSAGES:\n{context}\n\nUSER QUESTION: {query}\n\nANSWER:"}
+        ],
+        temperature=0.3,
+        max_tokens=400
+    )
+    return response.choices[0].message.content.strip()
 
 
 @app.get("/health")
@@ -112,7 +125,8 @@ async def health():
             count = db_conn.execute("SELECT COUNT(*) FROM books").fetchone()[0]
         except Exception:
             pass
-    return JSONResponse({"status": "ok", "index_ready": index_ready, "chunks": count})
+    return JSONResponse({"status": "ok", "index_ready": index_ready, "chunks": count,
+                         "groq": groq_client is not None})
 
 
 @app.websocket("/ws")
@@ -146,16 +160,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(default=""
                     "type": "status",
                     "message": "Searching 283 engineering books..."}))
 
-                try:
-                    passages = search_books(query)
-                except Exception as e:
-                    # FTS5 syntax error - retry with simple words
-                    try:
-                        simple = " ".join(query.split()[:5])
-                        passages = search_books(simple)
-                    except Exception:
-                        await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
-                        continue
+                passages = search_books(query)
 
                 if not passages:
                     await websocket.send_text(json.dumps({
@@ -168,33 +173,12 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(default=""
                     "type": "status", "message": "Generating answer..."}))
 
                 try:
-                    response = gemini_model.generate_content(
-                        build_prompt(query, passages),
-                        generation_config=genai.types.GenerationConfig(
-                            temperature=0.3, max_output_tokens=400)
-                    )
-                    answer = response.text.strip()
+                    answer = generate_answer(query, passages)
                 except Exception as e:
-                    err_str = str(e)
-                    if "429" in err_str or "quota" in err_str.lower():
-                        # Rate limit - wait 35 seconds and retry once
-                        await websocket.send_text(json.dumps({
-                            "type": "status",
-                            "message": "Rate limit reached, retrying in 35 seconds..."}))
-                        await asyncio.sleep(35)
-                        try:
-                            response = gemini_model.generate_content(
-                                build_prompt(query, passages),
-                                generation_config=genai.types.GenerationConfig(
-                                    temperature=0.3, max_output_tokens=400)
-                            )
-                            answer = response.text.strip()
-                        except Exception as e2:
-                            answer = "Rate limit exceeded. Please wait 1 minute and ask again."
-                            passages = []
-                    else:
-                        answer = f"Error: {err_str}"
-                        passages = []
+                    err = str(e)
+                    log.error(f"Groq error: {err}")
+                    answer = f"Error getting answer: {err[:200]}"
+                    passages = []
 
                 await websocket.send_text(json.dumps({
                     "type": "answer", "text": answer,
