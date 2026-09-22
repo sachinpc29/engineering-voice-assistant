@@ -64,7 +64,7 @@ async def lifespan(app: FastAPI):
     global gemini_model
     if GEMINI_API_KEY:
         genai.configure(api_key=GEMINI_API_KEY)
-        gemini_model = genai.GenerativeModel("gemini-3.6-flash")
+        gemini_model = genai.GenerativeModel("gemini-1.5-flash")
         log.info("Gemini configured.")
     loop = asyncio.get_event_loop()
     loop.run_in_executor(None, download_index)
@@ -175,8 +175,26 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(default=""
                     )
                     answer = response.text.strip()
                 except Exception as e:
-                    answer = f"Error generating answer: {str(e)}"
-                    passages = []
+                    err_str = str(e)
+                    if "429" in err_str or "quota" in err_str.lower():
+                        # Rate limit - wait 35 seconds and retry once
+                        await websocket.send_text(json.dumps({
+                            "type": "status",
+                            "message": "Rate limit reached, retrying in 35 seconds..."}))
+                        await asyncio.sleep(35)
+                        try:
+                            response = gemini_model.generate_content(
+                                build_prompt(query, passages),
+                                generation_config=genai.types.GenerationConfig(
+                                    temperature=0.3, max_output_tokens=400)
+                            )
+                            answer = response.text.strip()
+                        except Exception as e2:
+                            answer = "Rate limit exceeded. Please wait 1 minute and ask again."
+                            passages = []
+                    else:
+                        answer = f"Error: {err_str}"
+                        passages = []
 
                 await websocket.send_text(json.dumps({
                     "type": "answer", "text": answer,
