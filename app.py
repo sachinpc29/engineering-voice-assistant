@@ -1,4 +1,4 @@
-﻿import os
+import os
 import pickle
 import json
 import asyncio
@@ -42,38 +42,43 @@ STRICT RULES:
 def download_index():
     global bm25, metadata, chunk_offsets, chunks_file, index_ready
     log.info("Downloading index files from Hugging Face...")
-    base = "/tmp/bm25"
-    os.makedirs(base, exist_ok=True)
+    # hf_hub_download with local_dir="/tmp" + filename="bm25/file.pkl"
+    # saves file to /tmp/bm25/file.pkl  ← correct path
+    local_dir = "/tmp"
+    bm25_dir  = "/tmp/bm25"
+    os.makedirs(bm25_dir, exist_ok=True)
 
     files_needed = [
-        ("bm25/bm25_index.pkl",       f"{base}/bm25_index.pkl"),
-        ("bm25/metadata.pkl",          f"{base}/metadata.pkl"),
-        ("bm25/chunks.jsonl",          f"{base}/chunks.jsonl"),
-        ("bm25/chunks_offsets.npy",    f"{base}/chunks_offsets.npy"),
+        "bm25/bm25_index.pkl",
+        "bm25/metadata.pkl",
+        "bm25/chunks.jsonl",
+        "bm25/chunks_offsets.npy",
     ]
 
-    for hf_path, local_path in files_needed:
+    for hf_path in files_needed:
+        local_path = f"{local_dir}/{hf_path}"
         if not os.path.exists(local_path):
             log.info(f"Downloading {hf_path}...")
             hf_hub_download(
                 repo_id=DATASET_REPO, filename=hf_path,
                 repo_type="dataset", token=HF_TOKEN,
-                local_dir=base, local_dir_use_symlinks=False
+                local_dir=local_dir
             )
+            log.info(f"Downloaded to {local_path}")
 
     log.info("Loading BM25 index into RAM (~305MB)...")
-    with open(f"{base}/bm25_index.pkl", "rb") as f:
+    with open(f"{bm25_dir}/bm25_index.pkl", "rb") as f:
         bm25 = pickle.load(f)
 
     log.info("Loading metadata into RAM...")
-    with open(f"{base}/metadata.pkl", "rb") as f:
+    with open(f"{bm25_dir}/metadata.pkl", "rb") as f:
         metadata = pickle.load(f)
 
     log.info("Loading chunk offsets into RAM (tiny)...")
-    chunk_offsets = np.load(f"{base}/chunks_offsets.npy")
+    chunk_offsets = np.load(f"{bm25_dir}/chunks_offsets.npy")
 
     log.info("Opening chunks.jsonl file handle (stays on disk)...")
-    chunks_file = open(f"{base}/chunks.jsonl", "r", encoding="utf-8")
+    chunks_file = open(f"{bm25_dir}/chunks.jsonl", "r", encoding="utf-8")
 
     log.info(f"Index ready! {len(metadata):,} chunks available.")
     index_ready = True
