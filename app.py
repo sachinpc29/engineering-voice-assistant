@@ -64,7 +64,7 @@ async def lifespan(app: FastAPI):
     global gemini_model
     if GEMINI_API_KEY:
         genai.configure(api_key=GEMINI_API_KEY)
-        gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+        gemini_model = genai.GenerativeModel("gemini-3.6-flash")
         log.info("Gemini configured.")
     loop = asyncio.get_event_loop()
     loop.run_in_executor(None, download_index)
