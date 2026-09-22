@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sqlite3
 import json
 import asyncio
@@ -106,7 +106,7 @@ def generate_answer(query: str, passages: list) -> str:
         for p in passages
     ])
     response = groq_client.chat.completions.create(
-        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        model="llama-3.3-70b-versatile",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"SOURCE PASSAGES:\n{context}\n\nUSER QUESTION: {query}\n\nANSWER:"}
